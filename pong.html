@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>핑퐁 게임</title>
+<style>
+  :root {
+    --bg: #0b0f19;
+    --panel: #121826;
+    --fg: #e8ecf5;
+    --dim: #7f8ba3;
+    --accent: #4ade80;
+    --accent2: #60a5fa;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: var(--bg); color: var(--fg);
+    font-family: "Pretendard", "Malgun Gothic", system-ui, -apple-system, sans-serif;
+    overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+    touch-action: none;
+  }
+  #wrap {
+    height: 100%;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 12px; padding: 12px;
+  }
+  #hud {
+    width: min(900px, 100%);
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; font-size: 14px; color: var(--dim);
+  }
+  #hud strong { color: var(--fg); font-weight: 600; }
+  #canvasBox { position: relative; width: min(900px, 100%); }
+  canvas {
+    display: block; width: 100%; height: auto;
+    background: var(--panel);
+    border-radius: 12px;
+    box-shadow: 0 10px 40px rgba(0,0,0,.5);
+  }
+  #overlay {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 14px; text-align: center;
+    background: rgba(11,15,25,.82);
+    border-radius: 12px;
+    backdrop-filter: blur(3px);
+  }
+  #overlay.hidden { display: none; }
+  #overlay h1 { margin: 0; font-size: clamp(22px, 5vw, 38px); letter-spacing: -.5px; }
+  #overlay p { margin: 0; color: var(--dim); font-size: clamp(12px, 2.6vw, 15px); line-height: 1.7; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+  button {
+    font: inherit; font-size: 14px;
+    padding: 9px 16px; border-radius: 8px;
+    border: 1px solid #2a3346; background: #1b2233; color: var(--fg);
+    cursor: pointer; transition: background .15s, border-color .15s;
+  }
+  button:hover { background: #232c42; }
+  button.on { background: var(--accent2); border-color: var(--accent2); color: #08111f; font-weight: 600; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #06210f; font-weight: 700; padding: 11px 26px; font-size: 15px; }
+  #hint { font-size: 12px; color: var(--dim); text-align: center; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="hud">
+    <div>난이도 <strong id="diffLabel">보통</strong></div>
+    <div>먼저 <strong id="targetLabel">7</strong>점 획득 시 승리</div>
+    <div>최고 랠리 <strong id="bestLabel">0</strong></div>
+  </div>
+
+  <div id="canvasBox">
+    <canvas id="game" width="900" height="560"></canvas>
+    <div id="overlay">
+      <h1 id="ovTitle">핑퐁 게임</h1>
+      <p id="ovText">
+        마우스 · 터치로 이동, 또는 ↑ / ↓ · W / S 키<br>
+        Space 일시정지 · R 재시작
+      </p>
+      <div class="row" id="diffRow">
+        <button data-diff="easy">쉬움</button>
+        <button data-diff="normal" class="on">보통</button>
+        <button data-diff="hard">어려움</button>
+        <button data-diff="insane">불가능</button>
+      </div>
+      <div class="row">
+        <button class="primary" id="startBtn">시작</button>
+        <button id="soundBtn" class="on">소리 켜짐</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="hint">플레이어(왼쪽) vs 컴퓨터(오른쪽) — 랠리가 길어질수록 공이 빨라집니다</div>
+</div>
+
+<script>
+(() => {
+  const cv = document.getElementById('game');
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+
+  const overlay   = document.getElementById('overlay');
+  const ovTitle   = document.getElementById('ovTitle');
+  const ovText    = document.getElementById('ovText');
+  const startBtn  = document.getElementById('startBtn');
+  const soundBtn  = document.getElementById('soundBtn');
+  const diffRow   = document.getElementById('diffRow');
+  const diffLabel = document.getElementById('diffLabel');
+  const bestLabel = document.getElementById('bestLabel');
+  const targetLabel = document.getElementById('targetLabel');
+
+  const WIN_SCORE = 7;
+  targetLabel.textContent = WIN_SCORE;
+
+  // aiErr 은 예측 지점의 오차 폭(px). 패들 반높이(48px)를 넘어야 실제로 빗나가므로
+  // 그 경계를 기준으로 난이도별 실책 확률이 결정된다.
+  const DIFFS = {
+    easy:   { name: '쉬움',   aiSpeed: 300, aiErr: 92, ballSpeed: 330 },  // 실책 ~48%
+    normal: { name: '보통',   aiSpeed: 420, aiErr: 58, ballSpeed: 390 },  // 실책 ~17%
+    hard:   { name: '어려움', aiSpeed: 560, aiErr: 26, ballSpeed: 450 },  // 속도로만 실책
+    insane: { name: '불가능', aiSpeed: 900, aiErr: 4,  ballSpeed: 520 },  // 사실상 무결점
+  };
+
+  const PADDLE_W = 12, PADDLE_H = 96, PADDLE_MARGIN = 26;
+  const BALL_R = 8;
+  const PLAYER_SPEED = 620;      // 키보드 조작 속도 (px/s)
+  const MAX_BOUNCE_ANGLE = Math.PI / 3.2;
+  const SPEED_GAIN = 1.045;      // 랠리마다 가속
+  const MAX_BALL_SPEED = 1150;
+
+  let diff = DIFFS.normal;
+  let soundOn = true;
+  let state = 'menu';            // menu | serving | playing | paused | over
+  let bestRally = 0;
+
+  const player = { y: H / 2 - PADDLE_H / 2, vy: 0 };
+  const ai     = { y: H / 2 - PADDLE_H / 2, targetY: H / 2, err: 0 };
+  const ball   = { x: W / 2, y: H / 2, vx: 0, vy: 0, speed: 0 };
+  let score = { p: 0, a: 0 };
+  let rally = 0;
+  let serveTimer = 0;
+  let shakeT = 0;
+  const trail = [];
+  const sparks = [];
+
+  /* ---------- 사운드 ---------- */
+  let actx = null;
+  function beep(freq, dur = .07, type = 'square', gain = .05) {
+    if (!soundOn) return;
+    try {
+      if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+      if (actx.state === 'suspended') actx.resume();
+      const o = actx.createOscillator(), g = actx.createGain();
+      o.type = type; o.frequency.value = freq;
+      g.gain.setValueAtTime(gain, actx.currentTime);
+      g.gain.exponentialRampToValueAtTime(.0001, actx.currentTime + dur);
+      o.connect(g); g.connect(actx.destination);
+      o.start(); o.stop(actx.currentTime + dur);
+    } catch (e) { /* 오디오 불가 환경 무시 */ }
+  }
+
+  /* ---------- 게임 흐름 ---------- */
+  function resetBall(towardPlayer) {
+    ball.x = W / 2; ball.y = H / 2;
+    ball.speed = diff.ballSpeed;
+    // 너무 평평한 서브가 나오지 않도록 최소 각도 보장
+    const mag = 0.12 + Math.random() * 0.28;
+    const angle = Math.random() < .5 ? mag : -mag;
+    const dir = towardPlayer ? -1 : 1;
+    ball.vx = Math.cos(angle) * ball.speed * dir;
+    ball.vy = Math.sin(angle) * ball.speed;
+    ai.err = (Math.random() * 2 - 1) * diff.aiErr;   // 첫 리턴도 완벽하지 않도록
+    rally = 0;
+    trail.length = 0;
+  }
+
+  function newGame() {
+    score = { p: 0, a: 0 };
+    player.y = ai.y = H / 2 - PADDLE_H / 2;
+    resetBall(Math.random() < .5);
+    state = 'serving';
+    serveTimer = 1.0;
+    overlay.classList.add('hidden');
+  }
+
+  function pointScored(byPlayer) {
+    if (byPlayer) score.p++; else score.a++;
+    bestRally = Math.max(bestRally, rally);
+    bestLabel.textContent = bestRally;
+    beep(byPlayer ? 660 : 180, .18, 'sine', .07);
+    shakeT = .22;
+    burst(byPlayer ? W - 20 : 20, ball.y, byPlayer ? '#4ade80' : '#f87171');
+
+    if (score.p >= WIN_SCORE || score.a >= WIN_SCORE) {
+      state = 'over';
+      const win = score.p >= WIN_SCORE;
+      ovTitle.textContent = win ? '승리!' : '패배…';
+      ovText.innerHTML = `최종 스코어 <strong>${score.p} : ${score.a}</strong><br>최고 랠리 ${bestRally}회`;
+      startBtn.textContent = '다시 하기';
+      overlay.classList.remove('hidden');
+    } else {
+      resetBall(!byPlayer);   // 실점한 쪽으로 서브
+      state = 'serving';
+      serveTimer = .8;
+    }
+  }
+
+  function burst(x, y, color) {
+    for (let i = 0; i < 18; i++) {
+      const a = Math.random() * Math.PI * 2, s = 60 + Math.random() * 260;
+      sparks.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: .5, max: .5, color });
+    }
+  }
+
+  /* ---------- 입력 ---------- */
+  const keys = new Set();
+  let pointerY = null;
+
+  addEventListener('keydown', e => {
+    if (['ArrowUp', 'ArrowDown', ' ', 'Space'].includes(e.key)) e.preventDefault();
+    keys.add(e.key.toLowerCase());
+
+    if (e.key === ' ') {
+      if (state === 'playing' || state === 'serving') { state = 'paused'; showPause(); }
+      else if (state === 'paused') { state = 'playing'; overlay.classList.add('hidden'); }
+    }
+    if (e.key.toLowerCase() === 'r' && state !== 'menu') newGame();
+    if (e.key === 'Enter' && (state === 'menu' || state === 'over')) newGame();
+  });
+  addEventListener('keyup', e => keys.delete(e.key.toLowerCase()));
+
+  function showPause() {
+    ovTitle.textContent = '일시정지';
+    ovText.innerHTML = 'Space 로 계속 · R 로 재시작';
+    startBtn.textContent = '계속하기';
+    overlay.classList.remove('hidden');
+  }
+
+  function canvasY(clientY) {
+    const r = cv.getBoundingClientRect();
+    return (clientY - r.top) * (H / r.height);
+  }
+  cv.addEventListener('pointermove', e => { pointerY = canvasY(e.clientY); });
+  cv.addEventListener('pointerdown', e => {
+    cv.setPointerCapture(e.pointerId);
+    pointerY = canvasY(e.clientY);
+  });
+  cv.addEventListener('pointerleave', () => { pointerY = null; });
+
+  startBtn.addEventListener('click', () => {
+    if (state === 'paused') { state = 'playing'; overlay.classList.add('hidden'); }
+    else newGame();
+  });
+  soundBtn.addEventListener('click', () => {
+    soundOn = !soundOn;
+    soundBtn.classList.toggle('on', soundOn);
+    soundBtn.textContent = soundOn ? '소리 켜짐' : '소리 꺼짐';
+    if (soundOn) beep(880, .05);
+  });
+  diffRow.addEventListener('click', e => {
+    const btn = e.target.closest('button[data-diff]');
+    if (!btn) return;
+    diff = DIFFS[btn.dataset.diff];
+    diffLabel.textContent = diff.name;
+    [...diffRow.children].forEach(b => b.classList.toggle('on', b === btn));
+  });
+
+  /* ---------- 업데이트 ---------- */
+  function clampPaddle(p) { p.y = Math.max(0, Math.min(H - PADDLE_H, p.y)); }
+
+  function updatePlayer(dt) {
+    let moved = false;
+    if (keys.has('arrowup') || keys.has('w')) { player.y -= PLAYER_SPEED * dt; moved = true; }
+    if (keys.has('arrowdown') || keys.has('s')) { player.y += PLAYER_SPEED * dt; moved = true; }
+    if (!moved && pointerY !== null) {
+      const target = pointerY - PADDLE_H / 2;
+      player.y += (target - player.y) * Math.min(1, dt * 18);
+    }
+    clampPaddle(player);
+  }
+
+  function predictBallY() {
+    // 공이 AI 쪽으로 올 때만 낙하지점 예측, 아니면 중앙으로 복귀
+    if (ball.vx <= 0) return H / 2;
+    let x = ball.x, y = ball.y, vx = ball.vx, vy = ball.vy;
+    const goalX = W - PADDLE_MARGIN - PADDLE_W - BALL_R;
+    let guard = 0;
+    while (x < goalX && guard++ < 500) {
+      const tx = (goalX - x) / vx;
+      const ty = vy > 0 ? (H - BALL_R - y) / vy : (vy < 0 ? (BALL_R - y) / vy : Infinity);
+      const t = Math.min(tx, ty);
+      x += vx * t; y += vy * t;
+      if (ty < tx) vy = -vy;
+    }
+    return y;
+  }
+
+  function updateAI(dt) {
+    ai.targetY = predictBallY() + ai.err;
+    const center = ai.y + PADDLE_H / 2;
+    const d = ai.targetY - center;
+    const step = diff.aiSpeed * dt;
+    ai.y += Math.abs(d) < step ? d : Math.sign(d) * step;
+    clampPaddle(ai);
+  }
+
+  function hitPaddle(p, isPlayer) {
+    const rel = (ball.y - (p.y + PADDLE_H / 2)) / (PADDLE_H / 2); // -1..1
+    const clamped = Math.max(-1, Math.min(1, rel));
+    const angle = clamped * MAX_BOUNCE_ANGLE;
+    ball.speed = Math.min(MAX_BALL_SPEED, ball.speed * SPEED_GAIN);
+    const dir = isPlayer ? 1 : -1;
+    ball.vx = Math.cos(angle) * ball.speed * dir;
+    ball.vy = Math.sin(angle) * ball.speed;
+    // 패들 안에 박히지 않도록 밀어내기
+    ball.x = isPlayer
+      ? PADDLE_MARGIN + PADDLE_W + BALL_R + .1
+      : W - PADDLE_MARGIN - PADDLE_W - BALL_R - .1;
+
+    rally++;
+    if (!isPlayer) ai.err = (Math.random() * 2 - 1) * diff.aiErr;
+    beep(isPlayer ? 520 : 400, .05, 'square', .045);
+    shakeT = .07;
+  }
+
+  function updateBall(dt) {
+    // 고속 이동 시 터널링 방지: 스텝 분할
+    const steps = Math.max(1, Math.ceil(Math.abs(ball.vx * dt) / (BALL_R * 0.8)));
+    const sdt = dt / steps;
+
+    for (let i = 0; i < steps; i++) {
+      ball.x += ball.vx * sdt;
+      ball.y += ball.vy * sdt;
+
+      if (ball.y < BALL_R) { ball.y = BALL_R; ball.vy = Math.abs(ball.vy); beep(300, .03, 'triangle', .03); }
+      if (ball.y > H - BALL_R) { ball.y = H - BALL_R; ball.vy = -Math.abs(ball.vy); beep(300, .03, 'triangle', .03); }
+
+      const pRight = PADDLE_MARGIN + PADDLE_W;
+      if (ball.vx < 0 && ball.x - BALL_R <= pRight && ball.x - BALL_R >= PADDLE_MARGIN - 14) {
+        if (ball.y >= player.y - BALL_R && ball.y <= player.y + PADDLE_H + BALL_R) { hitPaddle(player, true); continue; }
+      }
+      const aLeft = W - PADDLE_MARGIN - PADDLE_W;
+      if (ball.vx > 0 && ball.x + BALL_R >= aLeft && ball.x + BALL_R <= W - PADDLE_MARGIN + 14) {
+        if (ball.y >= ai.y - BALL_R && ball.y <= ai.y + PADDLE_H + BALL_R) { hitPaddle(ai, false); continue; }
+      }
+
+      if (ball.x < -BALL_R * 3) { pointScored(false); return; }
+      if (ball.x > W + BALL_R * 3) { pointScored(true); return; }
+    }
+
+    trail.push({ x: ball.x, y: ball.y });
+    if (trail.length > 14) trail.shift();
+  }
+
+  function update(dt) {
+    if (shakeT > 0) shakeT = Math.max(0, shakeT - dt);
+
+    for (let i = sparks.length - 1; i >= 0; i--) {
+      const s = sparks[i];
+      s.life -= dt;
+      if (s.life <= 0) { sparks.splice(i, 1); continue; }
+      s.x += s.vx * dt; s.y += s.vy * dt; s.vy += 400 * dt;
+    }
+
+    if (state === 'serving') {
+      updatePlayer(dt); updateAI(dt);
+      serveTimer -= dt;
+      if (serveTimer <= 0) state = 'playing';
+      return;
+    }
+    if (state !== 'playing') return;
+
+    updatePlayer(dt);
+    updateAI(dt);
+    updateBall(dt);
+  }
+
+  /* ---------- 렌더 ---------- */
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function draw() {
+    ctx.save();
+    if (shakeT > 0) {
+      const m = shakeT * 26;
+      ctx.translate((Math.random() - .5) * m, (Math.random() - .5) * m);
+    }
+
+    ctx.fillStyle = '#121826';
+    ctx.fillRect(-30, -30, W + 60, H + 60);
+
+    // 중앙선
+    ctx.strokeStyle = 'rgba(255,255,255,.10)';
+    ctx.lineWidth = 4; ctx.setLineDash([14, 18]);
+    ctx.beginPath(); ctx.moveTo(W / 2, 0); ctx.lineTo(W / 2, H); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 점수
+    ctx.font = '700 84px system-ui, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    ctx.fillStyle = 'rgba(255,255,255,.08)';
+    ctx.fillText(score.p, W / 2 - 90, 34);
+    ctx.fillText(score.a, W / 2 + 90, 34);
+
+    // 랠리 카운트
+    if (rally > 2 && state === 'playing') {
+      ctx.font = '600 15px system-ui, sans-serif';
+      ctx.fillStyle = 'rgba(96,165,250,.55)';
+      ctx.fillText(`${rally} 연속`, W / 2, H - 40);
+    }
+
+    // 잔상
+    trail.forEach((t, i) => {
+      const a = (i / trail.length) * .28;
+      ctx.fillStyle = `rgba(96,165,250,${a})`;
+      ctx.beginPath();
+      ctx.arc(t.x, t.y, BALL_R * (i / trail.length) * .9 + 1, 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    // 패들
+    ctx.fillStyle = '#4ade80';
+    roundRect(PADDLE_MARGIN, player.y, PADDLE_W, PADDLE_H, 6); ctx.fill();
+    ctx.fillStyle = '#f87171';
+    roundRect(W - PADDLE_MARGIN - PADDLE_W, ai.y, PADDLE_W, PADDLE_H, 6); ctx.fill();
+
+    // 공
+    if (state !== 'over') {
+      ctx.shadowColor = 'rgba(96,165,250,.9)'; ctx.shadowBlur = 18;
+      ctx.fillStyle = '#e8ecf5';
+      ctx.beginPath(); ctx.arc(ball.x, ball.y, BALL_R, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+
+    // 파티클
+    sparks.forEach(s => {
+      ctx.globalAlpha = Math.max(0, s.life / s.max);
+      ctx.fillStyle = s.color;
+      ctx.fillRect(s.x - 2, s.y - 2, 4, 4);
+    });
+    ctx.globalAlpha = 1;
+
+    // 서브 카운트다운
+    if (state === 'serving') {
+      ctx.font = '700 44px system-ui, sans-serif';
+      ctx.fillStyle = 'rgba(232,236,245,.7)';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(Math.ceil(serveTimer * 3), W / 2, H / 2 - 4);
+      ctx.textBaseline = 'top';
+    }
+
+    ctx.restore();
+  }
+
+  /* ---------- 루프 ---------- */
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(.033, (now - last) / 1000);  // 탭 전환 시 점프 방지
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
